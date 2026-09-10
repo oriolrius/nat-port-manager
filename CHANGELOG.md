@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.0
+
+### New
+- Self-elevation: started without administrator rights, the script asks for them (UAC) and relaunches itself;
+  the TUI opens in a new elevated window and this window waits for it, headless commands run elevated and
+  relay their output back. `-NoElevate` disables it.
+
+### Docs
+- README section "TCP only: what about UDP?": why `netsh portproxy` cannot forward UDP, the WSL2 mirrored
+  networking recipe (with the Hyper-V firewall rule), and a relay-based fallback for NAT mode.
+- Local-only material is kept in an ignored `private/` folder.
+
 ## 2.0.0
 
 ### Performance

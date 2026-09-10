@@ -763,3 +763,58 @@ Describe 'TUI (rendered off-screen with scripted keys)' {
         { Invoke-MainLoop } | Should -Not -Throw
     }
 }
+
+Describe 'Self-elevation (UAC relaunch)' {
+    It 'builds a relaunch command line from the bound parameters' {
+        $bound = @{ Add = [switch]$true; ListenPort = @('8080', '8443'); ConnectAddress = 'wsl'; Firewall = 'None'; WhatIf = [switch]$true; Verbose = $true; NoElevate = [switch]$false }
+        $list = @(Get-SelfElevationArgument -Bound $bound -OutputFile 'C:\t m p\o.txt')
+        ($list[0..3] -join ' ') | Should -Be '-NoProfile -ExecutionPolicy Bypass -File'
+        $list[4] | Should -Match 'PortRedirectManager\.ps1"$'
+        ($list[5..($list.Count - 1)] -join ' ') | Should -Be '-Add -ConnectAddress "wsl" -Firewall "None" -ListenPort "8080,8443" -NoElevate -ElevatedOutputFile "C:\t m p\o.txt"'
+    }
+    It 'the TUI asks for elevation and returns 0 once the elevated run finished' {
+        Mock Test-IsElevated { $false }
+        Mock Test-InteractiveConsole { $true }
+        Mock Invoke-SelfElevated { }
+        (Invoke-Tui 6>$null) | Should -Be 0
+        Should -Invoke Invoke-SelfElevated -Times 1 -Exactly -ParameterFilter { ($ArgumentList -contains '-NoElevate') -and ($ArgumentList -notcontains '-ElevatedOutputFile') -and $ArgumentList[3] -eq '-File' }
+    }
+    It 'the TUI reports a refused UAC prompt and does not start' {
+        Mock Test-IsElevated { $false }
+        Mock Test-InteractiveConsole { $true }
+        Mock Invoke-SelfElevated { throw 'The operation was canceled by the user.' }
+        Mock Invoke-MainLoop { throw 'must not run' }
+        (Invoke-Tui 3>$null 6>$null) | Should -Be 1
+    }
+    It 'the TUI honours -NoElevate' {
+        Mock Test-IsElevated { $false }
+        Mock Test-InteractiveConsole { $true }
+        Mock Invoke-SelfElevated { throw 'must not be called' }
+        $script:NoElevate = $true
+        try { (Invoke-Tui 3>$null) | Should -Be 1 } finally { $script:NoElevate = $false }
+        Should -Invoke Invoke-SelfElevated -Times 0 -Exactly
+    }
+    It 'relays output, errors and the exit code from the elevated child' {
+        Mock Invoke-SelfElevated {
+            $file = $ArgumentList[-1].Trim('"')
+            Set-Content -LiteralPath $file -Value @('Added v4tov4 0.0.0.0:9000 -> 192.0.2.1:9000', '__ERROR__ boom', '__EXIT__ 1')
+        }
+        $out = @(Invoke-ElevatedRelay -Bound @{ Add = [switch]$true } 2>$null)
+        $out[0] | Should -Be 'Added v4tov4 0.0.0.0:9000 -> 192.0.2.1:9000'
+        $out[-1] | Should -Be 1
+    }
+    It 'fails clearly when the elevated child produced nothing (prompt cancelled)' {
+        Mock Invoke-SelfElevated { }
+        { Invoke-ElevatedRelay -Bound @{} } | Should -Throw '*no output*'
+    }
+    It 'the elevated child writes lines, errors and the exit code to the file' {
+        $file = Join-Path ([System.IO.Path]::GetTempPath()) ('prm-test-{0}.txt' -f [guid]::NewGuid())
+        try {
+            Invoke-HeadlessRelayChild -Command { 'one'; 'two' } -OutputFile $file | Should -Be 0
+            @(Get-Content -LiteralPath $file) -join '|' | Should -Be 'one|two|__EXIT__ 0'
+            Invoke-HeadlessRelayChild -Command { throw 'bad' } -OutputFile $file | Should -Be 1
+            @(Get-Content -LiteralPath $file) -join '|' | Should -Be '__ERROR__ bad|__EXIT__ 1'
+        }
+        finally { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
+    }
+}

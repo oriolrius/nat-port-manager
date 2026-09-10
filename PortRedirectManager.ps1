@@ -29,6 +29,11 @@
 .PARAMETER RemoveOrphans
     Delete PortRedirect_* firewall rules whose port-proxy rule no longer exists.
 
+.PARAMETER NoElevate
+    Do not ask for administrator rights (UAC) when the session is not elevated; fail with a message instead.
+    Without this switch the script relaunches itself elevated: the TUI opens in a new elevated window and this
+    window waits for it; headless commands run elevated in the background and print their output here.
+
 .PARAMETER Type
     Proxy type: v4tov4 (default), v4tov6, v6tov4 or v6tov6.
 
@@ -83,9 +88,10 @@
     Show what -Remove would do without changing anything.
 
 .NOTES
-    Version 2.0.0. Requires Windows 10/11 and Windows PowerShell 5.1 or PowerShell 7+.
-    Everything except -List needs an elevated session. Port-proxy rules only work while the
-    "IP Helper" (iphlpsvc) service is running; the TUI shows its state and can start it.
+    Version 2.1.0. Requires Windows 10/11 and Windows PowerShell 5.1 or PowerShell 7+.
+    Everything except -List needs administrator rights; the script asks for them (UAC) when needed, or
+    fails with a message when -NoElevate is given. Port-proxy rules only work while the "IP Helper"
+    (iphlpsvc) service is running; the TUI shows its state and can start it.
 
 .LINK
     https://github.com/oriolrius/nat-port-manager
@@ -138,7 +144,13 @@ param(
     [string]$From,
 
     [Parameter(ParameterSetName = 'Repoint', Mandatory = $true)]
-    [string]$To
+    [string]$To,
+
+    [switch]$NoElevate,
+
+    # Internal: set by the elevated child to relay its output to the unelevated parent.
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedOutputFile
 )
 
 Set-StrictMode -Version Latest
@@ -147,7 +159,7 @@ Set-StrictMode -Version Latest
 #  Constants, theme and state
 # =====================================================================================================
 
-$script:Version         = '2.0.0'
+$script:Version         = '2.1.0'
 $script:ProxyTypes      = @('v4tov4', 'v4tov6', 'v6tov4', 'v6tov6')
 $script:RulePrefix      = 'PortRedirect_'
 $script:RuleDescription = 'Created by PortRedirectManager for NAT port proxy'
@@ -155,6 +167,8 @@ $script:FirewallRegKey  = 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\
 $script:NetshPath       = Join-Path $env:SystemRoot 'System32\netsh.exe'
 $script:WslPath         = Join-Path $env:SystemRoot 'System32\wsl.exe'
 $script:MaxPortsPerAdd  = 64
+$script:SelfPath        = $PSCommandPath   # captured here: inside functions $PSCommandPath depends on the caller
+$script:NoElevate       = [bool]$NoElevate  # script-scope copy so functions read the same value in library mode
 $script:MinWidth        = 66
 $script:MinHeight       = 18
 
@@ -1935,6 +1949,16 @@ function Invoke-Tui {
         return 1
     }
     if (-not (Test-IsElevated)) {
+        if (-not $script:NoElevate) {
+            Write-Information -MessageData 'Not running as administrator: asking for elevation (UAC). The manager opens in a new elevated window; this window waits until it closes.' -InformationAction Continue
+            try {
+                Invoke-SelfElevated -ArgumentList (Get-SelfElevationArgument)
+                return 0
+            }
+            catch {
+                Write-Warning "Elevation failed or was refused: $($_.Exception.Message)"
+            }
+        }
         Write-Warning 'The interactive manager changes system settings and needs an elevated PowerShell (Run as Administrator).'
         Write-Warning 'Read-only listing works without elevation:  .\PortRedirectManager.ps1 -List'
         return 1
@@ -1968,6 +1992,92 @@ function Invoke-Tui {
         Clear-Console
     }
     return 0
+}
+
+# =====================================================================================================
+#  Self-elevation (UAC): relaunch this script elevated instead of asking the user for a new console
+# =====================================================================================================
+
+function Get-SelfElevationArgument {
+    <#
+    .SYNOPSIS
+        Build the argument list for an elevated relaunch of this script from the bound parameters.
+    #>
+    param([hashtable]$Bound = @{}, [string]$OutputFile = '')
+    $skip = @('NoElevate', 'ElevatedOutputFile', 'WhatIf', 'Confirm', 'Verbose', 'Debug', 'ErrorAction', 'WarningAction',
+        'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable',
+        'ProgressAction')
+    $list = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $script:SelfPath))
+    foreach ($name in @($Bound.Keys | Sort-Object)) {
+        if ($skip -contains $name) { continue }
+        $value = $Bound[$name]
+        if ($value -is [switch] -or $value -is [bool]) {
+            if ([bool]$value) { $list += "-$name" }
+            continue
+        }
+        $joined = (@($value) | ForEach-Object { "$_" }) -join ','
+        $list += "-$name"
+        $list += ('"{0}"' -f ($joined -replace '"', ''))
+    }
+    $list += '-NoElevate'
+    if ($OutputFile) { $list += '-ElevatedOutputFile'; $list += ('"{0}"' -f $OutputFile) }
+    return $list
+}
+
+function Invoke-SelfElevated {
+    <#
+    .SYNOPSIS
+        Start this PowerShell executable elevated (UAC prompt) with the given arguments and wait for it.
+        Throws when the prompt is refused or the launch fails.
+    #>
+    param([string[]]$ArgumentList)
+    $exe = (Get-Process -Id $PID).Path
+    $null = Start-Process -FilePath $exe -ArgumentList $ArgumentList -Verb RunAs -Wait -PassThru -ErrorAction Stop
+}
+
+function Invoke-ElevatedRelay {
+    <#
+    .SYNOPSIS
+        Run the current headless command in an elevated child and print its output here. Returns the exit code.
+    #>
+    param([hashtable]$Bound)
+    $tmp = [System.IO.Path]::GetTempFileName()
+    try {
+        Write-Verbose 'Not elevated: asking for administrator rights (UAC) and relaying the output.'
+        Invoke-SelfElevated -ArgumentList (Get-SelfElevationArgument -Bound $Bound -OutputFile $tmp)
+        $lines = @(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue)
+        if ($lines.Count -eq 0) { throw 'The elevated run produced no output (was the UAC prompt cancelled?)' }
+        $code = 1
+        foreach ($line in $lines) {
+            if ($line -match '^__EXIT__ (\d+)$') { $code = [int]$Matches[1] }
+            elseif ($line -match '^__ERROR__ (.*)$') { Write-Error -Message $Matches[1] -ErrorAction Continue }
+            else { Write-Output $line }
+        }
+        return $code
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-HeadlessRelayChild {
+    <#
+    .SYNOPSIS
+        Elevated child side: run the command, write every output line plus errors and the exit code to the file.
+    #>
+    param([scriptblock]$Command, [string]$OutputFile)
+    $lines = @()
+    $code = 0
+    try {
+        $lines = @(& $Command | ForEach-Object { "$_" })
+    }
+    catch {
+        $lines += "__ERROR__ $($_.Exception.Message)"
+        $code = 1
+    }
+    $lines += "__EXIT__ $code"
+    Set-Content -LiteralPath $OutputFile -Value $lines -Encoding UTF8
+    return $code
 }
 
 # =====================================================================================================
@@ -2088,14 +2198,33 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 
 # Note: "exit" is only used on failure. Calling it after emitting objects would discard PowerShell's
 # deferred table output, so the success path simply lets the script end (exit code 0).
+$setName = $PSCmdlet.ParameterSetName
+$headless = switch ($setName) {
+    'Add'     { { Invoke-HeadlessAdd -Type $Type -ListenAddress $ListenAddress -ListenPort $ListenPort -ConnectAddress $ConnectAddress -ConnectPort $ConnectPort -Firewall $Firewall } }
+    'Remove'  { { Invoke-HeadlessRemove -Type $Type -ListenAddress $ListenAddress -ListenPort $ListenPort } }
+    'Repoint' { { Invoke-HeadlessRepoint -From $From -To $To } }
+    'Orphans' { { Invoke-HeadlessOrphanCleanup } }
+    default   { $null }
+}
 try {
-    switch ($PSCmdlet.ParameterSetName) {
-        'List'    { Get-PortProxyRule }
-        'Add'     { Invoke-HeadlessAdd -Type $Type -ListenAddress $ListenAddress -ListenPort $ListenPort -ConnectAddress $ConnectAddress -ConnectPort $ConnectPort -Firewall $Firewall }
-        'Remove'  { Invoke-HeadlessRemove -Type $Type -ListenAddress $ListenAddress -ListenPort $ListenPort }
-        'Repoint' { Invoke-HeadlessRepoint -From $From -To $To }
-        'Orphans' { Invoke-HeadlessOrphanCleanup }
-        default   { if ((Invoke-Tui) -ne 0) { exit 1 } }
+    if ($setName -eq 'List') {
+        Get-PortProxyRule
+    }
+    elseif ($null -ne $headless) {
+        if ($ElevatedOutputFile) {
+            # We are the elevated child of an unelevated parent: relay everything through the file.
+            exit (Invoke-HeadlessRelayChild -Command $headless -OutputFile $ElevatedOutputFile)
+        }
+        if (-not $WhatIfPreference -and -not $NoElevate -and -not (Test-IsElevated)) {
+            $code = Invoke-ElevatedRelay -Bound $PSBoundParameters
+            if ($code -ne 0) { exit $code }
+        }
+        else {
+            & $headless
+        }
+    }
+    else {
+        if ((Invoke-Tui) -ne 0) { exit 1 }
     }
 }
 catch {

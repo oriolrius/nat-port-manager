@@ -40,22 +40,29 @@ works for any `netsh interface portproxy` redirect.
   without any UI. `-Add` takes port lists and ranges, so one call replaces a loop of `netsh` commands.
 - **Robust.** Works on Windows PowerShell 5.1 and PowerShell 7, in Windows Terminal and the classic console,
   with non-English Windows locales, small windows, and IPv6 rules.
+- **Self-elevating.** Started from a normal console, it asks for administrator rights (UAC) itself: the TUI
+  opens in a new elevated window and headless commands print their output back into the original one.
 
 ## Requirements
 
 - Windows 10 or 11
 - Windows PowerShell 5.1 or PowerShell 7+
-- An **elevated** session (Run as Administrator) for anything that changes rules. `-List` works unelevated.
+- Administrator rights for anything that changes rules. You do not need to open an elevated console: the
+  script asks for elevation (UAC) when required, or fails with a message if you pass `-NoElevate`.
+  `-List` and `-WhatIf` never need elevation.
 - The **IP Helper** service (`iphlpsvc`) must be running for port-proxy rules to have any effect. The TUI shows
   its state and can start it.
 
 ## Installation
 
-Download `PortRedirectManager.ps1` (or clone the repository) and run it from an elevated PowerShell:
+Download `PortRedirectManager.ps1` (or clone the repository) and run it:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\PortRedirectManager.ps1
 ```
+
+From a non-elevated console a UAC prompt appears and the manager opens in a new elevated window (Windows
+cannot elevate a running process in place); the original window waits until you quit the manager.
 
 ## Interactive mode
 
@@ -126,6 +133,7 @@ Everything the TUI does can be scripted. Failures print an error and exit with c
 | `-ConnectAddress`, `-To` | IP, hostname, or the keyword `wsl` for the current WSL2 IPv4 address |
 | `-ConnectPort` | Defaults to the listen port; only allowed with a single listen port |
 | `-Firewall` | `TCP` (default) or `None`. Port-proxy forwards TCP only, so no UDP rule is ever created |
+| `-NoElevate` | Never show a UAC prompt; fail with a message when not elevated |
 
 Run `Get-Help .\PortRedirectManager.ps1 -Full` for the complete reference.
 
@@ -154,11 +162,49 @@ Get-NetFirewallRule -Name 'PortRedirect_*' | Format-Table Name, Enabled
 **IP Helper.** Port-proxy is implemented by the IP Helper service. If it is stopped, rules exist but nothing
 listens. The TUI warns you and `S` starts it. Restarting it (also `S`) makes hostname targets resolve again.
 
+## TCP only: what about UDP?
+
+**`netsh portproxy` cannot forward UDP.** Every `add`/`set`/`delete` variant accepts a single protocol value,
+`[[protocol=]tcp]` ("Currently only TCP is supported"); entries are stored only under
+`HKLM\SYSTEM\CurrentControlSet\Services\PortProxy\<type>\tcp`, and the IP Helper service opens TCP listeners
+only. An inbound UDP firewall rule for such a port opens nothing behind it: with no UDP socket bound, datagrams
+are silently dropped. That is why this tool creates TCP firewall rules only.
+
+**Recommended: WSL2 mirrored networking** (Windows 11 22H2 build 22621.2359+ and WSL 2.0.5+, check with
+`wsl --version`). WSL then shares the host's interfaces and IP addresses, so a service bound to `0.0.0.0`
+inside WSL is reachable from the LAN directly, TCP or UDP, with no proxy at all:
+
+1. In `%USERPROFILE%\.wslconfig` (or the *WSL Settings* app):
+   ```ini
+   [wsl2]
+   networkingMode=mirrored
+   ```
+2. Free the port on Windows if a port-proxy rule holds it (delete it with `D` or `-Remove`).
+3. Allow the port in the Hyper-V firewall (elevated PowerShell; WSL's default inbound action is Block):
+   ```powershell
+   New-NetFirewallHyperVRule -Name "WSL-UDP-5000" -DisplayName "WSL UDP 5000" -Direction Inbound `
+       -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol UDP -LocalPorts 5000
+   ```
+4. `wsl --shutdown`, start WSL again, confirm `wslinfo --networking-mode` prints `mirrored`, bind the service
+   to `0.0.0.0` and test from another machine.
+
+Caveats: Windows and Linux share one port space (a Linux bind fails if Windows already listens there);
+UDP 68 and a few Windows service ports (TCP 135, 1900, 2869, 3702, 5004, 5357, 5358) are never steered to WSL;
+multicast and broadcast reception is the most-reported weak spot; Docker Desktop published ports and some
+VPN clients need extra care. See [Microsoft's WSL networking docs](https://learn.microsoft.com/windows/wsl/networking)
+and the [Hyper-V firewall reference](https://learn.microsoft.com/windows/security/operating-system-security/network-security/windows-firewall/hyper-v-firewall).
+
+**Fallback in NAT mode:** run a small UDP relay on the Windows side that listens on the port and forwards each
+datagram to the WSL IP (a few dozen lines with `System.Net.Sockets.UdpClient`, or a tool such as
+`neosmart/udpproxy`), and open the port with `F` -> *Add UDP* in the TUI. The service then sees the relay's
+address instead of the client's, and the relay must be restarted when the WSL IP changes. WinNAT static
+mappings (`Add-NetNatStaticMapping`) are not an option: WSL's NAT is an HNS/ICS network, not a NetNat instance.
+
 ## Troubleshooting
 
 | Symptom | What to check |
 |---------|---------------|
-| "needs an elevated PowerShell" | Start PowerShell with *Run as Administrator* (`-List` does not need it) |
+| No UAC prompt, "needs an elevated PowerShell" | You passed `-NoElevate`, or the session cannot show UAC (service, SSH, redirected console). Start PowerShell with *Run as Administrator* |
 | Rule exists but the port is closed | IP Helper service stopped (`S`), or no firewall rule (`F`), or the target is not listening |
 | Works from the Windows host but not from the LAN | The listen address must be `0.0.0.0` (not `127.0.0.1`) and a firewall rule must exist |
 | WSL2 IP "not detected" | No distribution is running (`wsl -l --running`); the tool never starts one for you. Press `R` after starting it |

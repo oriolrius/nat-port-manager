@@ -1,4 +1,5 @@
-# Logs and local scratch output
+# Local-only material (personal scripts, logs, scratch); never published
+private/
 *.log
 *.tmp
 

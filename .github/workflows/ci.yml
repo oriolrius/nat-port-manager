@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling (PowerShell 7)
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning, Error
+          $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          if ($results) { throw "PSScriptAnalyzer reported $($results.Count) issue(s)" }
+
+      - name: Pester (PowerShell 7)
+        shell: pwsh
+        run: |
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = './tests'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+
+      - name: Install Pester for Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Pester (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          Import-Module Pester -MinimumVersion 5.5
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = './tests'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+
+      - name: Smoke test headless mode
+        shell: pwsh
+        run: |
+          .\PortRedirectManager.ps1 -List | Format-Table | Out-String | Write-Host
+          .\PortRedirectManager.ps1 -Add -ListenPort 65000 -ConnectAddress 192.0.2.10 -Firewall TCP -WhatIf
+          .\PortRedirectManager.ps1 -Repoint -From 192.0.2.10 -To 192.0.2.11 -WhatIf

@@ -1,0 +1,14 @@
+# Logs and local scratch output
+*.log
+*.tmp
+
+# Test and analyzer output
+TestResults*.xml
+testResults*.xml
+coverage*.xml
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
